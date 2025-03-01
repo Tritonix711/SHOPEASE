@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Determine the database path dynamically
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # Get the directory of this file
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # Directory of this file
 DATA_DIR = os.path.join(BASE_DIR, 'data')              # Local 'data' folder path
 DB_PATH = os.path.join(DATA_DIR, 'inventory.db')       # Local database path: ShopEase/data/inventory.db
 
@@ -44,19 +44,32 @@ except sqlite3.Error as e:
 
 # Create tables and indexes if they don’t exist
 try:
+    # Products table: stores product details
     c.execute('''CREATE TABLE IF NOT EXISTS products
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, unit TEXT)''')
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  name TEXT NOT NULL, 
+                  unit TEXT NOT NULL)''')
 
+    # Transactions table: stores purchase/sale records
     c.execute('''CREATE TABLE IF NOT EXISTS transactions
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  product_id INTEGER,
-                  quantity REAL,
+                  product_id INTEGER NOT NULL,
+                  quantity REAL NOT NULL,
                   price REAL,
-                  date TEXT,
+                  date TEXT NOT NULL,
                   FOREIGN KEY(product_id) REFERENCES products(id))''')
 
-    # Add index for faster queries on transactions by product_id and date
+    # Daily Summaries table: stores daily cash flow summaries
+    c.execute('''CREATE TABLE IF NOT EXISTS daily_summaries
+                 (date TEXT PRIMARY KEY,
+                  cash_in REAL NOT NULL,
+                  cash_out REAL NOT NULL,
+                  purchase_costs REAL NOT NULL,
+                  profit_loss REAL NOT NULL)''')
+
+    # Add indexes for performance
     c.execute("CREATE INDEX IF NOT EXISTS idx_transactions_product_date ON transactions(product_id, date)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_daily_summaries_date ON daily_summaries(date)")
     conn.commit()
     logger.info("Tables and indexes created/verified successfully")
 except sqlite3.Error as e:
@@ -73,7 +86,7 @@ def add_product(name: str, unit: str) -> None:
         unit (str): Unit of measurement (e.g., "kg" or "কিলোগ্রাম").
     """
     try:
-        c.execute("INSERT INTO products (name, unit) VALUES (?, ?)", (name, unit))
+        c.execute("INSERT INTO products (name, unit) VALUES (?, ?)", (name.strip(), unit.strip()))
         conn.commit()
         logger.info(f"Added product: {name} with unit {unit}")
     except sqlite3.Error as e:
@@ -86,14 +99,14 @@ def add_transaction(product_id: int, quantity: float, price: Optional[float] = N
     Args:
         product_id (int): ID of the product.
         quantity (float): Quantity (positive for purchases, negative for sales).
-        price (float, optional): Price per unit for purchases (None for sales).
+        price (float, optional): Total purchase cost for purchases (None for sales).
     """
     try:
         date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         c.execute("INSERT INTO transactions (product_id, quantity, price, date) VALUES (?, ?, ?, ?)",
                   (product_id, quantity, price, date))
         conn.commit()
-        logger.info(f"Added transaction for product_id {product_id}: {quantity} at {price} INR on {date}")
+        logger.info(f"Added transaction for product_id {product_id}: {quantity} at total cost {price} INR on {date}")
     except sqlite3.Error as e:
         logger.error(f"Error adding transaction for product_id {product_id}: {e}")
         raise
@@ -104,24 +117,24 @@ def get_current_quantity(product_id: int) -> float:
     Args:
         product_id (int): ID of the product.
     Returns:
-        float: Current quantity, or 0 if no transactions exist.
+        float: Current quantity (purchases minus sales), or 0 if no transactions.
     """
     try:
         c.execute("SELECT SUM(quantity) FROM transactions WHERE product_id = ?", (product_id,))
         result = c.fetchone()[0]
-        return result if result is not None else 0
+        return result if result is not None else 0.0
     except sqlite3.Error as e:
         logger.error(f"Error getting current quantity for product_id {product_id}: {e}")
         raise
 
 def get_last_price_before_date(product_id: int, target_date: Optional[str] = None) -> Optional[float]:
     """
-    Get the last purchase price of a product on or before a specific date.
+    Get the last total purchase cost of a product on or before a specific date.
     Args:
         product_id (int): ID of the product.
         target_date (str, optional): Date in "YYYY-MM-DD HH:MM:SS" format, defaults to now.
     Returns:
-        float: Last price, or None if no purchase exists.
+        float: Last total cost, or None if no purchase exists.
     """
     try:
         if target_date is None:
@@ -162,7 +175,7 @@ def get_purchase_history(product_id: int, start_date: Optional[date] = None, end
         start_date (date, optional): Start date for the history (defaults to earliest transaction).
         end_date (date, optional): End date for the history (defaults to today).
     Returns:
-        list: List of tuples (date, quantity, price) for all purchases, sorted by date.
+        list: List of tuples (date, quantity, price) for all purchases, sorted by date, where price is total cost.
     """
     try:
         query = "SELECT date, quantity, price FROM transactions WHERE product_id = ? AND quantity > 0"
@@ -170,10 +183,10 @@ def get_purchase_history(product_id: int, start_date: Optional[date] = None, end
         
         if start_date:
             query += " AND date >= ?"
-            params.append(f"{start_date} 00:00:00")
+            params.append(start_date.strftime("%Y-%m-%d 00:00:00"))
         if end_date:
             query += " AND date <= ?"
-            params.append(f"{end_date} 23:59:59")
+            params.append(end_date.strftime("%Y-%m-%d 23:59:59"))
         
         query += " ORDER BY date ASC"
         c.execute(query, params)
@@ -204,7 +217,7 @@ def get_product_id(name: str) -> Optional[int]:
         int: Product ID, or None if not found.
     """
     try:
-        c.execute("SELECT id FROM products WHERE name = ?", (name,))
+        c.execute("SELECT id FROM products WHERE name = ?", (name.strip(),))
         result = c.fetchone()
         return result[0] if result else None
     except sqlite3.Error as e:
@@ -217,11 +230,11 @@ def get_transactions_by_date(selected_date: date) -> List[Tuple[int, str, float,
     Args:
         selected_date (date): Date object (e.g., from datetime.date).
     Returns:
-        list: List of tuples (transaction_id, product_name, quantity, price, unit, date) for purchases on that date.
+        list: List of tuples (transaction_id, product_name, quantity, price, unit, date) for purchases on that date, where price is total cost.
     """
     try:
-        start_date = f"{selected_date} 00:00:00"
-        end_date = f"{selected_date} 23:59:59"
+        start_date = selected_date.strftime("%Y-%m-%d 00:00:00")
+        end_date = selected_date.strftime("%Y-%m-%d 23:59:59")
         c.execute("SELECT t.id, p.name, t.quantity, t.price, p.unit, t.date FROM transactions t JOIN products p ON t.product_id = p.id WHERE t.quantity > 0 AND t.date BETWEEN ? AND ?",
                   (start_date, end_date))
         return c.fetchall()
@@ -235,7 +248,7 @@ def delete_transaction(transaction_id: int) -> Tuple[bool, str]:
     Args:
         transaction_id (int): ID of the transaction to delete.
     Returns:
-        tuple: (bool, str) - (success, message) indicating if deletion succeeded and why.
+        tuple: (bool, str) - (success, message) indicating if deletion succeeded or why it failed.
     """
     try:
         c.execute("SELECT product_id, quantity FROM transactions WHERE id = ?", (transaction_id,))
@@ -248,7 +261,6 @@ def delete_transaction(transaction_id: int) -> Tuple[bool, str]:
             c.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
             conn.commit()
             logger.info(f"Deleted transaction {transaction_id} for product_id {product_id}")
-            # Check if the product has any remaining transactions
             c.execute("SELECT COUNT(*) FROM transactions WHERE product_id = ?", (product_id,))
             if c.fetchone()[0] == 0:
                 c.execute("DELETE FROM products WHERE id = ?", (product_id,))
@@ -264,11 +276,11 @@ def get_daily_transactions(selected_date: date) -> List[Tuple[str, float, float,
     """
     Retrieve all transactions (purchases and sales) for a specific date.
     Returns:
-        list: List of tuples (product_name, quantity, price, type) where type is 'purchase' or 'sale'.
+        list: List of tuples (product_name, quantity, price, type) where type is 'purchase' or 'sale', and price is total cost for purchases.
     """
-    start_date = f"{selected_date} 00:00:00"
-    end_date = f"{selected_date} 23:59:59"
     try:
+        start_date = selected_date.strftime("%Y-%m-%d 00:00:00")
+        end_date = selected_date.strftime("%Y-%m-%d 23:59:59")
         c.execute("""
             SELECT p.name, t.quantity, t.price, 
                    CASE WHEN t.quantity > 0 THEN 'purchase' ELSE 'sale' END as type
@@ -285,12 +297,20 @@ def calculate_daily_earnings(selected_date: date) -> float:
     """
     Calculate daily earnings (sales revenue - purchase costs) for a specific date.
     Returns:
-        float: Net earnings in INR (negative for purchase costs, positive for sales revenue).
+        float: Net earnings in INR (negative for net purchase costs, positive for net sales revenue).
     """
-    transactions = get_daily_transactions(selected_date)
-    purchase_cost = sum(price * abs(quantity) for _, quantity, price, trans_type in transactions if trans_type == 'purchase' and price is not None)
-    sale_revenue = sum(price * abs(quantity) for _, quantity, price, trans_type in transactions if trans_type == 'sale' and price is not None)
-    return sale_revenue - purchase_cost
+    try:
+        transactions = get_daily_transactions(selected_date)
+        # For purchases, price is the total cost, no multiplication by quantity
+        purchase_cost = sum(price for _, quantity, price, trans_type in transactions if trans_type == 'purchase' and price is not None)
+        # For sales, price is assumed per-unit (adjust if total cost is needed later)
+        sale_revenue = sum(price * abs(quantity) for _, quantity, price, trans_type in transactions if trans_type == 'sale' and price is not None)
+        net_earnings = sale_revenue - purchase_cost
+        logger.info(f"Calculated daily earnings for {selected_date}: Sales Revenue={sale_revenue}, Purchase Cost={purchase_cost}, Net={net_earnings}")
+        return net_earnings
+    except Exception as e:
+        logger.error(f"Error calculating daily earnings for {selected_date}: {e}")
+        raise
 
 def estimate_daily_needs(selected_date: date) -> Dict[str, float]:
     """
@@ -298,19 +318,108 @@ def estimate_daily_needs(selected_date: date) -> Dict[str, float]:
     Returns:
         dict: Mapping of product names to estimated quantities needed (in units).
     """
-    transactions = get_daily_transactions(selected_date)
-    needs = {}
-    for product_name, quantity, _, trans_type in transactions:
-        if trans_type == 'sale':
-            needs[product_name] = needs.get(product_name, 0) + abs(quantity)
-    # Adjust for current inventory to estimate needs
-    for product_id, name, unit in get_all_products():
-        current_qty = get_current_quantity(product_id)
-        if name in needs and current_qty < needs[name]:
-            needs[name] = max(0, needs[name] - current_qty)
-        elif name not in needs and current_qty == 0:
-            needs[name] = 0.0  # No immediate need if stock exists
-    return needs
+    try:
+        transactions = get_daily_transactions(selected_date)
+        needs = {}
+        for product_name, quantity, _, trans_type in transactions:
+            if trans_type == 'sale':
+                needs[product_name] = needs.get(product_name, 0) + abs(quantity)
+        for product_id, name, unit in get_all_products():
+            current_qty = get_current_quantity(product_id)
+            if name in needs and current_qty < needs[name]:
+                needs[name] = max(0, needs[name] - current_qty)
+            elif name not in needs and current_qty == 0:
+                needs[name] = 0.0  # No immediate need if stock exists
+        return needs
+    except Exception as e:
+        logger.error(f"Error estimating daily needs for {selected_date}: {e}")
+        raise
+
+def save_daily_summary(selected_date: date, cash_in: float, cash_out: float, purchase_costs: float, profit_loss: float) -> None:
+    """
+    Save the daily cash flow summary for a specific date.
+    Args:
+        selected_date (date): Date of the summary.
+        cash_in (float): Total cash received.
+        cash_out (float): Total cash spent (manual).
+        purchase_costs (float): Cost of purchases for the day.
+        profit_loss (float): Calculated profit or loss.
+    """
+    try:
+        date_str = selected_date.isoformat()
+        cash_in = float(cash_in) if cash_in is not None else 0.0
+        cash_out = float(cash_out) if cash_out is not None else 0.0
+        purchase_costs = float(purchase_costs) if purchase_costs is not None else 0.0
+        profit_loss = float(profit_loss) if profit_loss is not None else 0.0
+
+        c.execute("""
+            INSERT OR REPLACE INTO daily_summaries (date, cash_in, cash_out, purchase_costs, profit_loss)
+            VALUES (?, ?, ?, ?, ?)
+        """, (date_str, cash_in, cash_out, purchase_costs, profit_loss))
+        conn.commit()
+        logger.info(f"Saved daily summary for {date_str}: Cash In={cash_in}, Cash Out={cash_out}, Purchase Costs={purchase_costs}, Profit/Loss={profit_loss}")
+    except (sqlite3.Error, ValueError) as e:
+        logger.error(f"Error saving daily summary for {selected_date}: {e}")
+        raise
+
+def get_daily_summary(selected_date: date) -> Optional[Tuple[float, float, float, float]]:
+    """
+    Retrieve the daily cash flow summary for a specific date.
+    Args:
+        selected_date (date): Date to retrieve the summary for.
+    Returns:
+        tuple: (cash_in, cash_out, purchase_costs, profit_loss) or None if no summary exists.
+    """
+    try:
+        date_str = selected_date.isoformat()
+        logger.info(f"Querying daily summary for date: {date_str}")
+        c.execute("SELECT cash_in, cash_out, purchase_costs, profit_loss FROM daily_summaries WHERE date = ?", (date_str,))
+        result = c.fetchone()
+        if result:
+            return (float(result[0]), float(result[1]), float(result[2]), float(result[3]))
+        return None
+    except sqlite3.Error as e:
+        logger.error(f"Error retrieving daily summary for {selected_date}: {e}")
+        raise
+
+def delete_daily_summary(selected_date: date) -> Tuple[bool, str]:
+    """
+    Delete a daily summary and all associated purchase transactions for a specific date.
+    Args:
+        selected_date (date): Date of the summary to delete.
+    Returns:
+        tuple: (bool, str) - (success, message) indicating if deletion succeeded or why it failed.
+    """
+    try:
+        date_str = selected_date.isoformat()
+        start_date = selected_date.strftime("%Y-%m-%d 00:00:00")
+        end_date = selected_date.strftime("%Y-%m-%d 23:59:59")
+
+        # Check if a summary exists
+        c.execute("SELECT date FROM daily_summaries WHERE date = ?", (date_str,))
+        summary_exists = c.fetchone() is not None
+
+        # Delete purchase transactions for the date (quantity > 0)
+        c.execute("DELETE FROM transactions WHERE date BETWEEN ? AND ? AND quantity > 0", (start_date, end_date))
+        trans_deleted = c.rowcount
+
+        # Delete the summary
+        c.execute("DELETE FROM daily_summaries WHERE date = ?", (date_str,))
+        summary_deleted = c.rowcount
+
+        conn.commit()
+
+        if summary_exists or trans_deleted > 0:
+            message = f"Daily summary and {trans_deleted} transaction(s) for {date_str} deleted successfully."
+            logger.info(message)
+            return True, message
+        else:
+            message = f"No daily summary or transactions found for {date_str}."
+            logger.info(message)
+            return False, message
+    except sqlite3.Error as e:
+        logger.error(f"Error deleting daily summary and transactions for {selected_date}: {e}")
+        raise
 
 def prune_old_transactions(keep_years: int = 2) -> None:
     """
@@ -340,5 +449,5 @@ def backup_database(backup_path: str = "backup_inventory.db") -> None:
         logger.error(f"Error backing up database: {e}")
         raise
 
-# Close the database connection when the script exits (optional, handled by Streamlit)
+# Note: Connection is left open for Streamlit; close manually if needed in other contexts
 # conn.close()
